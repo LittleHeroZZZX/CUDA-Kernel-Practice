@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.mypy_cache/
+
+# CUDA build artifacts
+*.o
+*.out
+a.out
+gemm_from_scratch/gemm
+gemm_from_scratch/native
+gemm_from_scratch/tile
+gemm_from_scratch/out.ptx
+
+# Nsight profiling reports
+*.ncu-rep
+
+# IDE
+.vscode/
+
+# Claude
+.claude/
