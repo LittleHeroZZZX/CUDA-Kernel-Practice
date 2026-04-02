@@ -9,10 +9,17 @@ __pycache__/
 *.o
 *.out
 a.out
-gemm_from_scratch/gemm
-gemm_from_scratch/native
-gemm_from_scratch/tile
-gemm_from_scratch/out.ptx
+examples/gemm/gemm
+examples/gemm/native
+examples/gemm/reg
+examples/gemm/tile
+examples/gemm/out.ptx
+
+# PyTorch extension build cache
+.build/
+
+# Practice sessions (personal work, not committed)
+kernels/sessions/
 
 # Nsight profiling reports
 *.ncu-rep
