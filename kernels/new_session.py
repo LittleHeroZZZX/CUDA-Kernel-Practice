@@ -122,22 +122,27 @@ extern "C" void launch_block_reduce_sum(const float* x, float* out, int n, cudaS
     "flash_attention": """\
 #include <cuda_runtime.h>
 
-// TODO: implement flash attention (single head, causal).
+// TODO: implement flash attention (4D tensors [B, H, N, d], causal mask).
+//
+// Grid:  x = ceil(N / BLOCK_Q),  y = B * H
+// Block: BLOCK_Q threads
+// Each blockIdx.y selects one (batch, head) slice; the slice base offset is
+//   blockIdx.y * N * d  (tensors are contiguous in [B, H, N, d] layout).
 
 __global__ void flash_attention_kernel(
     const float* q, const float* k, const float* v,
-    float* o, int n, int d, float scale
+    float* o, int N, int d, float scale
 ) {
     // TODO
-    (void)q; (void)k; (void)v; (void)o; (void)n; (void)d; (void)scale;
+    (void)q; (void)k; (void)v; (void)o; (void)N; (void)d; (void)scale;
 }
 
 extern "C" void launch_flash_attention(
     const float* q, const float* k, const float* v,
-    float* o, int n, int d, float scale, cudaStream_t stream
+    float* o, int B, int H, int N, int d, float scale, cudaStream_t stream
 ) {
-    // TODO
-    (void)q; (void)k; (void)v; (void)o; (void)n; (void)d; (void)scale; (void)stream;
+    // TODO: set grid = (ceil(N/BLOCK_Q), B*H), block = BLOCK_Q
+    (void)q; (void)k; (void)v; (void)o; (void)B; (void)H; (void)N; (void)d; (void)scale; (void)stream;
 }
 """,
     "fused_mha": """\
@@ -325,12 +330,14 @@ torch::Tensor block_reduce_sum(torch::Tensor x) {
 
 torch::Tensor flash_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     CHECK_INPUT(q); CHECK_INPUT(k); CHECK_INPUT(v);
-    TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2, "flash_attention expects 2D tensors");
-    int n = (int)q.size(0), d = (int)q.size(1);
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                "flash_attention expects 4D tensors [B, H, N, d]");
+    TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(), "K/V shape mismatch");
+    int B = (int)q.size(0), H = (int)q.size(1), N = (int)q.size(2), d = (int)q.size(3);
     float scale = 1.0f / std::sqrt((float)d);
     auto out = torch::zeros_like(q);
     launch_flash_attention(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-                           out.data_ptr<float>(), n, d, scale, get_stream());
+                           out.data_ptr<float>(), B, H, N, d, scale, get_stream());
     check_cuda_err();
     return out;
 }

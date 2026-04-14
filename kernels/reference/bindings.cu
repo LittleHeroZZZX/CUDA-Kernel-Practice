@@ -124,17 +124,19 @@ torch::Tensor flash_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v)
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-    TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2, "flash_attention expects 2D tensors");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                "flash_attention expects 4D tensors [B, H, N, d]");
 
-    int N = static_cast<int>(q.size(0));
-    int d = static_cast<int>(q.size(1));
-    TORCH_CHECK(static_cast<int>(k.size(0)) == N && static_cast<int>(v.size(0)) == N, "K/V shape mismatch");
-    TORCH_CHECK(static_cast<int>(k.size(1)) == d && static_cast<int>(v.size(1)) == d, "K/V dim mismatch");
+    int B = static_cast<int>(q.size(0));
+    int H = static_cast<int>(q.size(1));
+    int N = static_cast<int>(q.size(2));
+    int d = static_cast<int>(q.size(3));
+    TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(), "K/V shape mismatch");
     TORCH_CHECK(d <= MAX_D, "d exceeds MAX_D");
 
     auto out = torch::zeros_like(q);
     dim3 block(BLOCK_Q);
-    dim3 grid((N + BLOCK_Q - 1) / BLOCK_Q);
+    dim3 grid((N + BLOCK_Q - 1) / BLOCK_Q, B * H);
     float scale = 1.0f / std::sqrt(static_cast<float>(d));
 
     flash_attention_kernel<<<grid, block, 0, get_stream()>>>(
@@ -172,6 +174,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layernorm", &layernorm, "LayerNorm (CUDA)");
     m.def("rmsnorm", &rmsnorm, "RMSNorm (CUDA)");
     m.def("block_reduce_sum", &block_reduce_sum_forward, "Block reduce sum (CUDA)");
-    m.def("flash_attention", &flash_attention, "Flash attention (CUDA)");
+    m.def("flash_attention", static_cast<torch::Tensor(*)(torch::Tensor, torch::Tensor, torch::Tensor)>(&flash_attention), "Flash attention (CUDA)");
     m.def("fused_mha", &fused_mha, "Fused MHA (CUDA)");
 }

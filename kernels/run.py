@@ -95,6 +95,15 @@ def check_close(a, b, rtol=1e-3, atol=1e-3):
     return torch.allclose(a, b, rtol=rtol, atol=atol)
 
 
+# Per-op tolerances — ops that use tf32 matmuls accumulate more error than
+# naive torch (which also uses tf32 but in a single fused kernel path).
+VERIFY_TOL = {
+    "gemm":            dict(rtol=1e-2, atol=1e-1),  # TF32: ~10-bit mantissa, error accumulates over K
+    "flash_attention": dict(rtol=1e-2, atol=3e-3),
+    "fused_mha":       dict(rtol=1e-2, atol=3e-3),
+}
+
+
 # ── Extension loaders ──────────────────────────────────────────────────────────
 
 _STD_EXT = None
@@ -132,9 +141,12 @@ def _load_session_ext(session_dir):
     name = "llm_kernels_session_" + session_dir.name.replace("-", "_")
     build = session_dir / ".build"
     build.mkdir(exist_ok=True)
+    kernel_sources = sorted(
+        str(f) for f in session_dir.glob("*.cu") if f.name != "bindings.cu"
+    )
     _SESSION_EXT = load(
         name=name,
-        sources=[str(bindings)],
+        sources=[str(bindings)] + kernel_sources,
         extra_include_paths=[str(session_dir)],
         extra_cuda_cflags=["--use_fast_math"],
         with_cuda=True,
@@ -183,12 +195,13 @@ def ref_block_reduce(device, n=1 << 20):
     return (x,), torch.sum(x)
 
 
-def ref_flash_attention(device, n=256, d=64):
+def ref_flash_attention(device, b=2, h=4, n=256, d=64):
     q, k, v = [
-        torch.randn((n, d), device=device, dtype=torch.float32) for _ in range(3)
+        torch.randn((b, h, n, d), device=device, dtype=torch.float32) for _ in range(3)
     ]
     scale = 1.0 / (d**0.5)
-    scores = torch.matmul(q, k.transpose(0, 1)) * scale
+    # scores: [B, H, N, N]
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     mask = torch.tril(torch.ones((n, n), device=device, dtype=torch.bool))
     scores = scores.masked_fill(~mask, float("-inf"))
     return (q, k, v), torch.matmul(torch.softmax(scores, dim=-1), v)
@@ -254,11 +267,11 @@ VERIFY_CASES = {
         dict(n=100003),  # non-power-of-2
     ],
     "flash_attention": [
-        dict(n=64, d=32),
-        dict(n=128, d=64),
-        dict(n=256, d=64),
-        dict(n=128, d=128),
-        dict(n=257, d=64),  # non-power-of-2 seq
+        dict(b=1, h=1, n=64,  d=32),
+        dict(b=2, h=2, n=128, d=64),
+        dict(b=1, h=4, n=256, d=64),
+        dict(b=2, h=4, n=128, d=128),
+        dict(b=1, h=2, n=257, d=64),   # non-power-of-2 seq
     ],
     "fused_mha": [
         dict(num_q=1, n=64, d=32),  # single-query decode
@@ -291,9 +304,9 @@ BENCH_CASES = {
         dict(n=2048 * 4096, label="n = 8M  (2048 × 4096)"),
     ],
     "flash_attention": [
-        # single-head self-attention at seq=2048, head_dim=128
-        dict(n=2048, d=128, label="seq=2048  d=128"),
-        dict(n=4096, d=128, label="seq=4096  d=128  4K context"),
+        # LLaMA-7B style: 32 heads, head_dim=128
+        dict(b=1, h=32, n=2048, d=128, label="b=1 h=32 seq=2048 d=128"),
+        dict(b=1, h=32, n=4096, d=128, label="b=1 h=32 seq=4096 d=128  4K ctx"),
     ],
     "fused_mha": [
         # single-token decode: 1 query attending to full KV cache
@@ -317,7 +330,7 @@ def _case_label(op, case):
         n = case["n"]
         return f"n={n:,}"
     if op == "flash_attention":
-        return f"n={case['n']} d={case['d']}"
+        return f"b={case['b']} h={case['h']} n={case['n']} d={case['d']}"
     if op == "fused_mha":
         return f"q={case['num_q']} kv={case['n']} d={case['d']}"
     return str(case)
@@ -345,12 +358,7 @@ def _torch_forward(op, inputs, variant="layernorm"):
         return torch.sum(x)
     if op == "flash_attention":
         q, k, v = inputs
-        d = q.size(-1)
-        scale = 1.0 / (d**0.5)
-        scores = torch.matmul(q, k.transpose(0, 1)) * scale
-        mask = torch.tril(torch.ones_like(scores, dtype=torch.bool))
-        scores = scores.masked_fill(~mask, float("-inf"))
-        return torch.matmul(torch.softmax(scores, dim=-1), v)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
     if op == "fused_mha":
         q, k, v = inputs
         d = q.size(-1)
@@ -389,6 +397,10 @@ def _run_backend(op, backend, inputs, session_dir, variant="layernorm"):
     if backend == "torch":
         return _torch_forward(op, inputs, variant)
     if backend == "std":
+        # Flash attention reference CUDA is unoptimized; use the triton reference instead.
+        if op == "flash_attention":
+            m = _import_from_session("flash_attention_triton", KERNELS_STD)
+            return m.forward(*inputs)
         return _ext_forward(_load_std_ext(), op, inputs, variant)
     if backend == "triton":
         if session_dir is None:
@@ -442,11 +454,23 @@ def _run_verify(ops, backend, device, session_dir, show_traceback=False):
                     kw = {k: v for k, v in case.items() if k != "label"}
                     inputs, ref = REFS[op](device, **kw)
                     out = _run_backend(op, backend, inputs, session_dir, variant)
-                    if check_close(out, ref):
+                    if check_close(out, ref, **VERIFY_TOL.get(op, {})):
                         tag = green("PASS")
                         op_pass += 1
                     else:
-                        tag = red("FAIL") + dim("  values differ")
+                        if isinstance(out, (tuple, list)):
+                            abs_err = max(
+                                (o - r).abs().max().item()
+                                for o, r in zip(out, ref)
+                            )
+                            rel_err = max(
+                                ((o - r).abs() / (r.abs() + 1e-8)).max().item()
+                                for o, r in zip(out, ref)
+                            )
+                        else:
+                            abs_err = (out - ref).abs().max().item()
+                            rel_err = ((out - ref).abs() / (ref.abs() + 1e-8)).max().item()
+                        tag = red("FAIL") + dim(f"  abs={abs_err:.2e}  rel={rel_err:.2e}")
                         op_fail += 1
                 except NotImplementedError as exc:
                     msg = str(exc).splitlines()[0][:40] or "not implemented"
